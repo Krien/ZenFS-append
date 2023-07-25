@@ -1,3 +1,9 @@
+# ZenFS with appends
+
+We modified ZenFS to support appends. Currently this relies on SZD (<https://github.com/Krien/SimpleZNSDevice>) being installed globally.
+Additionally, since SZD depends on SPDK, SPDK needs to be installed globally as well. Note that we do not use the SPDK functionality.
+All code changes are in: `zenfs.mk`, `zbd_zenfs.cc/h`, `zbdlib_zenfs.cc/h`, `io_zenfs.cc/h`, `fs_zenfs.cc/h`.
+
 # ZenFS: RocksDB Storage Backend for ZNS SSDs and SMR HDDs
 
 ZenFS is a file system plugin that utilizes [RocksDB](https://github.com/facebook/rocksdb)'s FileSystem interface to
@@ -9,6 +15,7 @@ garbage collection in the file system or on the disk, improving performance
 in terms of throughput, tail latencies and disk endurance.
 
 ## Community
+
 For help or questions about zenfs usage (e.g. "how do I do X?") see below, on join us on [Matrix](https://app.element.io/#/room/#zonedstorage-general:matrix.org), or on [Slack](https://join.slack.com/t/zonedstorage/shared_invite/zt-uyfut5xe-nKajp9YRnEWqiD4X6RkTFw).
 
 To report a bug, file a documentation issue, or submit a feature request, please open a GitHub issue.
@@ -17,7 +24,7 @@ For release announcements and other discussions, please subscribe to this reposi
 
 ## Dependencies
 
-ZenFS depends on[ libzbd ](https://github.com/westerndigitalcorporation/libzbd)
+ZenFS depends on[libzbd](https://github.com/westerndigitalcorporation/libzbd)
 and Linux kernel 5.4 or later to perform zone management operations. To use
 ZenFS on SSDs with Zoned Namespaces, Linux kernel 5.9 or later is required.
 ZenFS works with RocksDB version v6.19.3 or later.
@@ -26,27 +33,30 @@ ZenFS works with RocksDB version v6.19.3 or later.
 
 ## Build
 
-Download, build and install libzbd. See the libzbd [ README ](https://github.com/westerndigitalcorporation/libzbd/blob/master/README.md) 
+Download, build and install libzbd. See the libzbd [README](https://github.com/westerndigitalcorporation/libzbd/blob/master/README.md)
 for instructions.
 
 Download rocksdb and the zenfs projects:
+
 ```
-$ git clone https://github.com/facebook/rocksdb.git
-$ cd rocksdb
-$ git clone https://github.com/westerndigitalcorporation/zenfs plugin/zenfs
+git clone https://github.com/facebook/rocksdb.git
+cd rocksdb
+git clone https://github.com/westerndigitalcorporation/zenfs plugin/zenfs
 ```
 
 Build and install rocksdb with zenfs enabled:
+
 ```
-$ DEBUG_LEVEL=0 ROCKSDB_PLUGINS=zenfs make -j48 db_bench install
+DEBUG_LEVEL=0 ROCKSDB_PLUGINS=zenfs make -j48 db_bench install
 ```
 
 Build the zenfs utility:
+
 ```
-$ pushd
-$ cd plugin/zenfs/util
-$ make
-$ popd
+pushd
+cd plugin/zenfs/util
+make
+popd
 ```
 
 ## Configure the IO Scheduler for the zoned block device
@@ -128,8 +138,8 @@ for the drive.
 
 `cd tests; ./zenfs_base_performance.sh <zoned block device name> [ <zonefs mountpoint> ]`
 
-
 ## Crashtesting
+
 To run the crashtesting scripts, Python3 is required.
 Crashtesting is done through the modified db_crashtest.py
 (original [db_crashtest.py](https://github.com/facebook/rocksdb/blob/main/tools/db_crashtest.py)).
@@ -140,6 +150,7 @@ However the goal for ZenFS crashtesting is to cover a specified set of
 parameters rather than randomized continuous testing.
 
 The convenience script can be used to run all crashtest sets defined in `tests/crashtest`.
+
 ```
 cd tests; ./zenfs_base_crashtest.sh <zoned block device name>
 ```
@@ -156,9 +167,10 @@ prometheus export of metrics. Exporter will listen on 127.0.0.1:8080.
 # ZenFS Internals
 
 ## Architecture overview
+
 ![zenfs stack](https://user-images.githubusercontent.com/447288/84152469-fa3d6300-aa64-11ea-87c4-8a6653bb9d22.png)
 
-ZenFS implements the FileSystem API, and stores all data files on to a raw 
+ZenFS implements the FileSystem API, and stores all data files on to a raw
 zoned block device. Log and lock files are stored on the default file system
 under a configurable directory. Zone management is done through libzbd and
 ZenFS io is done through normal pread/pwrite calls.
@@ -172,14 +184,14 @@ Files are mapped into into a set of extents:
 * A zone may contain more than one extent
 * Extents from different files may share zones
 
-### Reclaim 
+### Reclaim
 
-ZenFS is exceptionally lazy at current state of implementation and does 
+ZenFS is exceptionally lazy at current state of implementation and does
 not do any garbage collection whatsoever. As files gets deleted, the used
 capacity zone counters drops and when it reaches zero, a zone can be reset
 and reused.
 
-###  Metadata 
+### Metadata
 
 Metadata is stored in a rolling log in the first zones of the block device.
 
