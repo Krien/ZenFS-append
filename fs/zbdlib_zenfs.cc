@@ -27,7 +27,15 @@ ZbdlibBackend::ZbdlibBackend(std::string bdevname)
     : filename_("/dev/" + bdevname),
       read_f_(-1),
       read_direct_f_(-1),
-      write_f_(-1) {}
+      write_f_(-1) {
+#ifdef REORDER_WAL_TEST
+  for (size_t i = 0; i < 16; i++) {
+    tmp_appends_val[i] = nullptr;
+    tmps_wals_bools[i] = false;
+    tmps_wals_size[i] = 0;
+  }
+#endif
+}
 
 std::string ZbdlibBackend::ErrorToString(int err) {
   char *err_str = strerror(err);
@@ -132,11 +140,15 @@ IOStatus ZbdlibBackend::Reset(uint64_t start, bool *offline,
   int ret;
 
   ret = zbd_reset_zones(write_f_, start, zone_sz_);
-  if (ret) return IOStatus::IOError("Zone reset failed\n");
+  if (ret) {
+    return IOStatus::IOError("Zone reset failed\n");
+  }
 
   ret = zbd_report_zones(read_f_, start, zone_sz_, ZBD_RO_ALL, &z, &report);
 
-  if (ret || (report != 1)) return IOStatus::IOError("Zone report failed\n");
+  if (ret || (report != 1)) {
+    return IOStatus::IOError("Zone report failed\n");
+  }
 
   if (zbd_zone_offline(&z)) {
     *offline = true;
@@ -168,15 +180,88 @@ IOStatus ZbdlibBackend::Close(uint64_t start) {
 }
 
 int ZbdlibBackend::InvalidateCache(uint64_t pos, uint64_t size) {
-  return posix_fadvise(read_f_, pos, size, POSIX_FADV_DONTNEED);
+  int ret = posix_fadvise(read_f_, pos, size, POSIX_FADV_DONTNEED);
+  return ret;
 }
 
 int ZbdlibBackend::Read(char *buf, int size, uint64_t pos, bool direct) {
-  return pread(direct ? read_direct_f_ : read_f_, buf, size, pos);
+  int ret = pread(direct ? read_direct_f_ : read_f_, buf, size, pos);
+  return ret;
 }
 
 int ZbdlibBackend::Write(char *data, uint32_t size, uint64_t pos) {
-  return pwrite(write_f_, data, size, pos);
+  int ret = pwrite(write_f_, data, size, pos);
+  return ret;
+}
+
+int ZbdlibBackend::AppendSync(SZD::SZDOnceLog *wal) {
+  int ret = 0;
+#ifdef REORDER_WAL_TEST
+  for (size_t i = 16; i >= 1; i--) {
+    if (!tmps_wals_bools[i - 1]) {
+      continue;
+    }
+    ret = wal->AsyncAppend(tmp_appends_val[i - 1], tmps_wals_size[i - 1],
+                           NULL) == SZD::SZDStatus::Success;
+    tmps_wals_bools[i - 1] = false;
+    delete[] tmp_appends_val[i - 1];
+  }
+#else
+  (void)wal;
+#endif
+  return ret;
+}
+
+int ZbdlibBackend::Append(char *data, uint32_t size, SZD::SZDOnceLog *wal) {
+  // wal_mtx_.lock();
+  int ret;
+
+#ifdef REORDER_WAL_TEST
+  size_t i = 0;
+  for (; i < 16; i++) {
+    if (!tmps_wals_bools[i]) {
+      tmps_wals_bools[i] = true;
+      break;
+    }
+  }
+  if (i < 16) {
+    tmp_appends_val[i] = new char[size];
+    memcpy(tmp_appends_val[i], data, size);
+    tmps_wals_size[i] = size;
+  } else {
+    for (i = 16; i >= 2; i -= 2) {
+      ret = (wal->AsyncAppend(tmp_appends_val[i - 1], tmps_wals_size[i - 1],
+                              NULL) == SZD::SZDStatus::Success);
+      wal->Sync();
+      tmps_wals_bools[i - 1] = false;
+      delete[] tmp_appends_val[i - 1];
+    }
+    for (i = 15; i >= 1; i = i > 1 ? i - 2 : 0) {
+      ret = (wal->AsyncAppend(tmp_appends_val[i - 1], tmps_wals_size[i - 1],
+                              NULL) == SZD::SZDStatus::Success);
+      wal->Sync();
+      tmps_wals_bools[i - 1] = false;
+      delete[] tmp_appends_val[i - 1];
+    }
+
+    tmp_appends_val[0] = new char[size];
+    tmps_wals_bools[0] = true;
+    memcpy(tmp_appends_val[0], data, size);
+    tmps_wals_size[0] = size;
+  }
+  ret = size;
+  return ret;
+#else
+  ret = wal->AsyncAppend(data, size, NULL) == SZD::SZDStatus::Success;
+  if (!ret) {
+    errno = -ret;
+    // wal_mtx_.unlock();
+    return -1;
+  }
+
+  // We will do sync elsewhere...
+  return size;
+#endif
 }
 
 }  // namespace ROCKSDB_NAMESPACE

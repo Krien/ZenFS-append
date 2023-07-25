@@ -24,10 +24,20 @@
 #include <utility>
 #include <vector>
 
+#include <liburing.h>
+
 #include "metrics.h"
 #include "rocksdb/env.h"
 #include "rocksdb/file_system.h"
 #include "rocksdb/io_status.h"
+
+#include <szd/szd_namespace.h>
+#include <szd/datastructures/szd_buffer.hpp>
+#include <szd/datastructures/szd_log.hpp>
+#include <szd/datastructures/szd_once_log.hpp>
+#include <szd/szd_channel.hpp>
+#include <szd/szd_channel_factory.hpp>
+#include <szd/szd_device.hpp>
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -70,6 +80,7 @@ class Zone {
   IOStatus Close();
 
   IOStatus Append(char *data, uint32_t size);
+  IOStatus ZoneAppend(char *data, uint32_t size, SZD::SZDOnceLog *wal);
   bool IsUsed();
   bool IsFull();
   bool IsEmpty();
@@ -110,6 +121,8 @@ class ZonedBlockDeviceBackend {
   virtual IOStatus Close(uint64_t start) = 0;
   virtual int Read(char *buf, int size, uint64_t pos, bool direct) = 0;
   virtual int Write(char *data, uint32_t size, uint64_t pos) = 0;
+  virtual int Append(char *data, uint32_t size,  SZD::SZDOnceLog *wal) = 0;
+  virtual int AppendSync(SZD::SZDOnceLog *wal) = 0;
   virtual int InvalidateCache(uint64_t pos, uint64_t size) = 0;
   virtual bool ZoneIsSwr(std::unique_ptr<ZoneList> &zones,
                          unsigned int idx) = 0;
@@ -143,6 +156,7 @@ class ZonedBlockDevice {
  private:
   std::unique_ptr<ZonedBlockDeviceBackend> zbd_be_;
   std::vector<Zone *> io_zones;
+  std::vector<Zone *> wal_zones;
   std::vector<Zone *> meta_zones;
   time_t start_time_;
   std::shared_ptr<Logger> logger_;
@@ -168,10 +182,29 @@ class ZonedBlockDevice {
 
   std::shared_ptr<ZenFSMetrics> metrics_;
 
+  // int passthrough_fd_{-1};
+  // struct io_uring* io_ring_{nullptr};
+
+  SZD::SZDDevice *szd_device_{nullptr};
+  SZD::SZDChannelFactory *szd_factory_{nullptr};
+  SZD::DeviceInfo *di{nullptr};
+  SZD::SZDChannel **write_channel_{nullptr};
+  std::atomic<int> write_channel_ptr_{0};
+  // Some safity that no WAL uses the same channel concurrently...
+  const uint8_t write_channel_size_{8};
+
+
+
   void EncodeJsonZone(std::ostream &json_stream,
                       const std::vector<Zone *> zones);
 
  public:
+
+  int AppendSync(SZD::SZDOnceLog *wal) {
+    return zbd_be_->AppendSync(wal); 
+  }    
+
+
   explicit ZonedBlockDevice(std::string path, ZbdBackendType backend,
                             std::shared_ptr<Logger> logger,
                             std::shared_ptr<ZenFSMetrics> metrics =
@@ -181,10 +214,14 @@ class ZonedBlockDevice {
   IOStatus Open(bool readonly, bool exclusive);
 
   Zone *GetIOZone(uint64_t offset);
+  SZD::SZDOnceLog *GetWAL(uint64_t offset);
 
   IOStatus AllocateIOZone(Env::WriteLifeTimeHint file_lifetime, IOType io_type,
                           Zone **out_zone);
   IOStatus AllocateMetaZone(Zone **out_meta_zone);
+  
+  IOStatus OpenWALZone(SZD::SZDOnceLog **wal, Zone* active_zone);
+  IOStatus AllocateWALZone(Zone **wal_zones, SZD::SZDOnceLog **wal, Zone* active_zone);
 
   uint64_t GetFreeSpace();
   uint64_t GetUsedSpace();
@@ -193,6 +230,7 @@ class ZonedBlockDevice {
   std::string GetFilename();
   uint32_t GetBlockSize();
 
+  IOStatus ReleaseUnusedWALZones();
   IOStatus ResetUnusedIOZones();
   void LogZoneStats();
   void LogZoneUsage();
@@ -231,6 +269,8 @@ class ZonedBlockDevice {
   uint64_t GetTotalBytesWritten() { return bytes_written_.load(); };
 
  private:
+  IOStatus CloseCharacterDevice();
+  IOStatus OpenCharacterDevice(std::string path);
   IOStatus GetZoneDeferredStatus();
   bool GetActiveIOZoneTokenIfAvailable();
   void WaitForOpenIOZoneToken(bool prioritized);

@@ -17,6 +17,12 @@ zenfs_HEADERS-y = \
 	fs/zonefs_zenfs.h \
 	fs/zbdlib_zenfs.h
 
+
+PKG_CONFIG_PATH = $(SPDK_DIR)/build/lib/pkgconfig
+SPDK_LIB := $(shell PKG_CONFIG_PATH="$(PKG_CONFIG_PATH)" pkg-config --libs spdk_nvme)
+DPDK_LIB := $(shell PKG_CONFIG_PATH="$(PKG_CONFIG_PATH)" pkg-config --libs spdk_env_dpdk)
+SYS_LIB := $(shell PKG_CONFIG_PATH="$(PKG_CONFIG_PATH)" pkg-config --libs --static spdk_syslibs)
+
 zenfs_PKGCONFIG_REQUIRES-y += "libzbd >= 1.5.0"
 
 ZENFS_EXPORT_PROMETHEUS ?= n
@@ -28,7 +34,8 @@ zenfs_PKGCONFIG_REQUIRES-$(ZENFS_EXPORT_PROMETHEUS) += ", prometheus-cpp-pull ==
 zenfs_SOURCES += $(zenfs_SOURCES-y)
 zenfs_HEADERS += $(zenfs_HEADERS-y)
 zenfs_CXXFLAGS += $(zenfs_CXXFLAGS-y)
-zenfs_LDFLAGS += -u zenfs_filesystem_reg
+zenfs_CXXFLAGS += -I/usr/local/include
+zenfs_LDFLAGS += -u zenfs_filesystem_reg -lszd -lszd_extended -Wl,--no-as-needed -luuid $(SPDK_LIB) $(DPDK_LIB) -Wl,--as-needed
 
 ZENFS_ROOT_DIR := $(shell dirname $(realpath $(lastword $(MAKEFILE_LIST))))
 

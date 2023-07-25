@@ -192,7 +192,6 @@ IOStatus ZenMetaLog::Read(Slice* slice) {
     read += ret;
     read_pos_ += ret;
   }
-
   return IOStatus::OK();
 }
 
@@ -554,6 +553,11 @@ std::shared_ptr<ZoneFile> ZenFS::GetFile(std::string fname) {
   return zoneFile;
 }
 
+inline bool ends_with(std::string const& value, std::string const& ending) {
+  if (ending.size() > value.size()) return false;
+  return std::equal(ending.rbegin(), ending.rend(), value.rbegin());
+}
+
 /* Must hold files_mtx_ */
 IOStatus ZenFS::DeleteFileNoLock(std::string fname, const IOOptions& options,
                                  IODebugContext* dbg) {
@@ -561,7 +565,14 @@ IOStatus ZenFS::DeleteFileNoLock(std::string fname, const IOOptions& options,
   IOStatus s;
 
   fname = FormatPathLexically(fname);
+
   zoneFile = GetFileNoLock(fname);
+
+  if (ends_with(fname, ".log")) {
+    // printf("Delete WAL %s with size %lu\n", fname.data(),
+    // zoneFile->GetFileSize());
+  }
+
   if (zoneFile != nullptr) {
     std::string record;
 
@@ -578,10 +589,21 @@ IOStatus ZenFS::DeleteFileNoLock(std::string fname, const IOOptions& options,
       if (zoneFile->GetNrLinks() > 0) return s;
       /* Mark up the file as deleted so it won't be migrated by GC */
       zoneFile->SetDeleted();
+
+      // Deletion record is persisted to metadata (so resetting zones should be
+      // safe) We delete immediately
+      if (ends_with(fname, ".log")) {
+        zoneFile->ResetZones();
+      }
+
       zoneFile.reset();
     }
   } else {
     s = target()->DeleteFile(ToAuxPath(fname), options, dbg);
+  }
+
+  if (ends_with(fname, ".log")) {
+    // printf("Delete WAL done %s \n", fname.data());
   }
 
   return s;
@@ -596,6 +618,10 @@ IOStatus ZenFS::NewSequentialFile(const std::string& filename,
 
   Debug(logger_, "New sequential file: %s direct: %d\n", fname.c_str(),
         file_opts.use_direct_reads);
+
+  if (ends_with(fname, ".log")) {
+    // printf("Sequential WAL opened %s \n", fname.data());
+  }
 
   if (zoneFile == nullptr) {
     return target()->NewSequentialFile(ToAuxPath(fname), file_opts, result,
@@ -613,6 +639,10 @@ IOStatus ZenFS::NewRandomAccessFile(const std::string& filename,
   std::string fname = FormatPathLexically(filename);
   std::shared_ptr<ZoneFile> zoneFile = GetFile(fname);
 
+  if (ends_with(fname, ".log")) {
+    // printf("Random access WAL opened %s \n", fname.data());
+  }
+
   Debug(logger_, "New random access file: %s direct: %d\n", fname.c_str(),
         file_opts.use_direct_reads);
 
@@ -625,11 +655,6 @@ IOStatus ZenFS::NewRandomAccessFile(const std::string& filename,
   return IOStatus::OK();
 }
 
-inline bool ends_with(std::string const& value, std::string const& ending) {
-  if (ending.size() > value.size()) return false;
-  return std::equal(ending.rbegin(), ending.rend(), value.rbegin());
-}
-
 IOStatus ZenFS::NewWritableFile(const std::string& filename,
                                 const FileOptions& file_opts,
                                 std::unique_ptr<FSWritableFile>* result,
@@ -637,7 +662,7 @@ IOStatus ZenFS::NewWritableFile(const std::string& filename,
   std::string fname = FormatPathLexically(filename);
   Debug(logger_, "New writable file: %s direct: %d\n", fname.c_str(),
         file_opts.use_direct_writes);
-
+  // printf("New file %s \n", filename.data());
   return OpenWritableFile(fname, file_opts, result, nullptr, false);
 }
 
@@ -826,6 +851,8 @@ IOStatus ZenFS::OpenWritableFile(const std::string& filename,
   IOStatus s;
   std::string fname = FormatPathLexically(filename);
   bool resetIOZones = false;
+
+  bool is_wal = ends_with(fname, ".log");
   {
     std::lock_guard<std::mutex> file_lock(files_mtx_);
     std::shared_ptr<ZoneFile> zoneFile = GetFileNoLock(fname);
@@ -850,7 +877,7 @@ IOStatus ZenFS::OpenWritableFile(const std::string& filename,
     zoneFile->AddLinkName(fname);
 
     /* RocksDB does not set the right io type(!)*/
-    if (ends_with(fname, ".log")) {
+    if (is_wal) {
       zoneFile->SetIOType(IOType::kWAL);
       zoneFile->SetSparse(!file_opts.use_direct_writes);
     } else {
@@ -898,6 +925,7 @@ IOStatus ZenFS::GetFileModificationTime(const std::string& filename,
   IOStatus s;
 
   Debug(logger_, "GetFileModificationTime: %s \n", f.c_str());
+
   std::lock_guard<std::mutex> lock(files_mtx_);
   if (files_.find(f) != files_.end()) {
     zoneFile = files_[f];
@@ -1825,11 +1853,14 @@ IOStatus ZenFS::MigrateFileExtents(
     if (zfile->IsSparse()) {
       // For buffered write, ZenFS use inlined metadata for extents and each
       // extent has a SPARSE_HEADER_SIZE.
-      target_start = target_zone->wp_ + ZoneFile::SPARSE_HEADER_SIZE;
-      zfile->MigrateData(ext->start_ - ZoneFile::SPARSE_HEADER_SIZE,
-                         ext->length_ + ZoneFile::SPARSE_HEADER_SIZE,
+      uint64_t header_size =
+          ZoneFile::SPARSE_HEADER_SIZE +
+          (zfile->IsWAL() * ZoneFile::SPARSE_WAL_HEADER_SIZE);
+
+      target_start = target_zone->wp_ + header_size;
+      zfile->MigrateData(ext->start_ - header_size, ext->length_ + header_size,
                          target_zone);
-      zbd_->AddGCBytesWritten(ext->length_ + ZoneFile::SPARSE_HEADER_SIZE);
+      zbd_->AddGCBytesWritten(ext->length_ + header_size);
     } else {
       zfile->MigrateData(ext->start_, ext->length_, target_zone);
       zbd_->AddGCBytesWritten(ext->length_);

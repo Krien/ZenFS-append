@@ -162,8 +162,10 @@ int zenfs_tool_mkfs() {
 
   if (create_aux_dir(FLAGS_aux_path.c_str())) return 1;
 
+  printf("About to open \n");
   std::unique_ptr<ZonedBlockDevice> zbd = zbd_open(false, true);
   if (!zbd) return 1;
+  printf("opened \n");
 
   std::unique_ptr<ZenFS> zenFS;
   s = zenfs_mount(zbd, &zenFS, false);

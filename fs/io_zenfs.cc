@@ -11,6 +11,7 @@
 #include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <liburing.h>
 #include <libzbd/zbd.h>
 #include <linux/blkzoned.h>
 #include <stdlib.h>
@@ -19,6 +20,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <cmath>
 #include <iostream>
 #include <string>
 #include <utility>
@@ -63,6 +65,7 @@ enum ZoneFileTag : uint32_t {
   kActiveExtentStart = 7,
   kIsSparse = 8,
   kLinkedFilename = 9,
+  kWALSeq = 10,
 };
 
 void ZoneFile::EncodeTo(std::string* output, uint32_t extent_start) {
@@ -81,6 +84,12 @@ void ZoneFile::EncodeTo(std::string* output, uint32_t extent_start) {
     PutFixed32(output, kExtent);
     extents_[i]->EncodeTo(&extent_str);
     PutLengthPrefixedSlice(output, Slice(extent_str));
+  }
+
+  // Get sequence number
+  if (is_wal_) {
+    PutFixed32(output, kWALSeq);
+    PutFixed64(output, wal_seq_.load(std::memory_order_consume));
   }
 
   PutFixed32(output, kModificationTime);
@@ -147,6 +156,7 @@ Status ZoneFile::DecodeFrom(Slice* input) {
     Slice slice;
     ZoneExtent* extent;
     Status s;
+    SZD::SZDOnceLog* wal_pos;
 
     if (!GetFixed32(input, &tag)) break;
 
@@ -174,6 +184,15 @@ Status ZoneFile::DecodeFrom(Slice* input) {
           return Status::Corruption("ZoneFile", "Invalid zone extent");
         extent->zone_->used_capacity_ += extent->length_;
         extents_.push_back(extent);
+
+        // Reload WAL
+        if (wal_ == nullptr) {
+          wal_pos = zbd_->GetWAL(extent->start_);
+          if (wal_pos != nullptr) {
+            wal_ = wal_pos;
+          }
+        }
+
         break;
       case kModificationTime:
         uint64_t ct;
@@ -199,6 +218,12 @@ Status ZoneFile::DecodeFrom(Slice* input) {
 
         linkfiles_.push_back(slice.ToString());
         break;
+      case kWALSeq:
+        uint64_t wal_seq;
+        if (!GetFixed64(input, &wal_seq))
+          return Status::Corruption("ZoneFile", "Missing sequence number");
+        wal_seq_.store(wal_seq, std::memory_order_acquire);
+        break;
       default:
         return Status::Corruption("ZoneFile", "Unexpected tag");
     }
@@ -215,6 +240,11 @@ Status ZoneFile::MergeUpdate(std::shared_ptr<ZoneFile> update, bool replace) {
   SetFileSize(update->GetFileSize());
   SetWriteLifeTimeHint(update->GetWriteLifeTimeHint());
   SetFileModificationTime(update->GetFileModificationTime());
+
+  uint64_t wal_seq = wal_seq_.load(std::memory_order_consume);
+  if (update->GetWALSeq() > wal_seq) {
+    wal_seq_.store(update->GetWALSeq(), std::memory_order_acquire);
+  }
 
   if (replace) {
     ClearExtents();
@@ -254,12 +284,76 @@ ZoneFile::ZoneFile(ZonedBlockDevice* zbd, uint64_t file_id,
 std::string ZoneFile::GetFilename() { return linkfiles_[0]; }
 time_t ZoneFile::GetFileModificationTime() { return m_time_; }
 
+inline bool ends_with(std::string const& value, std::string const& ending) {
+  if (ending.size() > value.size()) return false;
+  return std::equal(ending.rbegin(), ending.rend(), value.rbegin());
+}
+
 uint64_t ZoneFile::GetFileSize() { return file_size_; }
 void ZoneFile::SetFileSize(uint64_t sz) { file_size_ = sz; }
 void ZoneFile::SetFileModificationTime(time_t mt) { m_time_ = mt; }
-void ZoneFile::SetIOType(IOType io_type) { io_type_ = io_type; }
+void ZoneFile::SetIOType(IOType io_type) {
+  io_type_ = io_type;
+  is_wal_ = io_type_ == IOType::kWAL && ends_with(GetFilename(), ".log");
+}
 
-ZoneFile::~ZoneFile() { ClearExtents(); }
+ZoneFile::~ZoneFile() {
+  if (wal_read_time_count_ > 0) {
+    printf("Wal recovery c:%lu s:%lu a:%f st:%f\n", wal_read_time_count_,
+           wal_read_time_sum_,
+           static_cast<double>(wal_read_time_sum_) /
+               static_cast<double>(wal_read_time_count_),
+           std::sqrt(static_cast<double>(
+                         wal_read_time_sum_squared_ * wal_read_time_count_ -
+                         wal_read_time_sum_ * wal_read_time_sum_) /
+                     static_cast<double>(wal_read_time_count_ *
+                                         wal_read_time_count_)));
+  }
+
+  ClearExtents();
+
+  if (wal_) {
+    // An anti-pattern to circumentvent weirdness when sync is not called before
+    // deletion.
+    zbd_->AppendSync(wal_);
+    wal_->Sync();
+    delete wal_;
+  }
+
+  if (wal_entries_.size() > 0) {
+    for (auto w : wal_entries_) {
+      delete w.second;
+    }
+  }
+  wal_entries_.clear();
+}
+
+IOStatus ZoneFile::ResetZones() {
+  IOStatus s = IOStatus::OK();
+  Zone* z = nullptr;
+  if (extents_.size() > 0 && !wal_) {
+    z = extents_[0]->zone_;
+    while (!z->Acquire())
+      ;
+    s = zbd_->OpenWALZone(&wal_, z);
+    if (!s.ok()) return s;
+  }
+
+  if (wal_) {
+    s = wal_->ResetAll() == SZD::SZDStatus::Success
+            ? IOStatus::OK()
+            : IOStatus::IOError("WAL sync error");
+    if (s.ok()) {
+      s = zbd_->ReleaseUnusedWALZones();
+    }
+  }
+
+  if (z != nullptr) {
+    z->Release();
+  }
+
+  return s;
+}
 
 void ZoneFile::ClearExtents() {
   for (auto e = std::begin(extents_); e != std::end(extents_); ++e) {
@@ -274,6 +368,12 @@ void ZoneFile::ClearExtents() {
 
 IOStatus ZoneFile::CloseActiveZone() {
   IOStatus s = IOStatus::OK();
+  if (is_wal_ && wal_ != NULL) {
+    s = wal_->Sync() == SZD::SZDStatus::Success
+            ? IOStatus::OK()
+            : IOStatus::IOError("Failed syncing WAL");
+  }
+
   if (active_zone_) {
     bool full = active_zone_->IsFull();
     s = active_zone_->Close();
@@ -335,6 +435,20 @@ ZoneExtent* ZoneFile::GetExtent(uint64_t file_offset, uint64_t* dev_offset) {
   return NULL;
 }
 
+ZoneExtent* ZoneFile::GetWALExtent(uint64_t file_offset, uint64_t* dev_offset,
+                                   uint64_t* index) {
+  for (unsigned int i = *index; i < extents_.size(); i++) {
+    if (file_offset < extents_[i]->length_) {
+      *dev_offset = file_offset;
+      *index = i;
+      return extents_[i];
+    } else {
+      file_offset -= extents_[i]->length_;
+    }
+  }
+  return NULL;
+}
+
 IOStatus ZoneFile::InvalidateCache(uint64_t pos, uint64_t size) {
   ReadLock lck(this);
   uint64_t offset = pos;
@@ -367,13 +481,129 @@ IOStatus ZoneFile::InvalidateCache(uint64_t pos, uint64_t size) {
   return s;
 }
 
-IOStatus ZoneFile::PositionedRead(uint64_t offset, size_t n, Slice* result,
-                                  char* scratch, bool direct) {
+IOStatus ZoneFile::RecoverWAL() {
+  IOStatus s = IOStatus::OK();
+  std::string commit_string;
+
+  struct timespec tp_1;
+  struct timespec tp_2;
+  struct timespec tp_3;
+  struct timespec tp_r;
+  clock_gettime(CLOCK_MONOTONIC, &tp_1);
+
+  // Ensure that we can recover and that there is something to recover in the
+  // first place.
+  if (extents_.size() == 0) {
+    return s;
+  }
+  if (!wal_) {
+    s = zbd_->OpenWALZone(&wal_, extents_[0]->zone_);
+    if (!s.ok()) return s;
+  }
+
+  // Cleanup leaks
+  if (wal_entries_.size() > 0) {
+    for (auto w : wal_entries_) {
+      delete w.second;
+    }
+  }
+  wal_entries_.clear();
+
+  clock_gettime(CLOCK_MONOTONIC, &tp_r);
+
+  // Raed the entire WAL into memory
+  s = wal_->ReadAll(commit_string) == SZD::SZDStatus::Success
+          ? IOStatus::OK()
+          : IOStatus::IOError("Error WAL read all");
+
+  clock_gettime(CLOCK_MONOTONIC, &tp_2);
+
+  // Read the whole thing into chunks...
+  char* ptr = commit_string.data();
+  uint64_t r = 0, br = 0;
+  uint64_t max_seq = 0;
+  uint64_t header_sz =
+      ZoneFile::SPARSE_HEADER_SIZE + ZoneFile::SPARSE_WAL_HEADER_SIZE;
+
+  while (r < commit_string.size() && br < file_size_) {
+    uint64_t size = DecodeFixed64(ptr);
+    uint64_t seqn = DecodeFixed64(ptr + sizeof(uint64_t));
+
+    if (seqn > max_seq) max_seq = seqn;
+
+    std::string* dat = new std::string;
+    // IMPORTANT: We skip the header! We do not NEED the information
+    dat->assign(ptr + header_sz, size);
+    wal_entries_.push_back(std::make_pair(seqn, dat));
+
+    br += size;
+    r += size + header_sz;
+    ptr += size + header_sz;
+  }
+
+  if (r != commit_string.size() && br != file_size_) {
+    s = IOStatus::Corruption("Overshooting WAL\n");
+    return s;
+  }
+
+  // Sort the whole thing
+  std::sort(
+      wal_entries_.begin(), wal_entries_.end(),
+      [](std::pair<uint64_t, std::string*> a,
+         std::pair<uint64_t, std::string*> b) { return a.first < b.first; });
+
+  // Yes +1. The sequence number is pointing to where the new entry will be
+  // stored.
+  if (wal_seq_.load(std::memory_order_consume) != max_seq + 1 ||
+      max_seq + 1 != wal_entries_.size()) {
+    return IOStatus::Corruption("Incorrect sequence numbers in WAL\n");
+  }
+
+  clock_gettime(CLOCK_MONOTONIC, &tp_3);
+
+  uint64_t time_passed = 0;
+  if (tp_2.tv_nsec < tp_r.tv_nsec) {
+    time_passed += 1000'000'000 - (tp_r.tv_nsec - tp_2.tv_nsec);
+    tp_2.tv_sec -= 1;
+  } else {
+    time_passed += tp_2.tv_nsec - tp_r.tv_nsec;
+  }
+  time_passed += 1000'000'000 * (tp_2.tv_sec - tp_r.tv_sec);
+  printf("WAL recovery (read) time %lu\n", time_passed);
+
+  time_passed = 0;
+  if (tp_3.tv_nsec < tp_1.tv_nsec) {
+    time_passed += 1000'000'000 - (tp_1.tv_nsec - tp_3.tv_nsec);
+    tp_3.tv_sec -= 1;
+  } else {
+    time_passed += tp_3.tv_nsec - tp_1.tv_nsec;
+  }
+  time_passed += 1000'000'000 * (tp_3.tv_sec - tp_1.tv_sec);
+  printf("WAL recovery (total) time %lu\n", time_passed);
+
+  printf("WAL recovered with %lu entries and size %lu, wal_size %lu\n",
+         wal_seq_.load(std::memory_order_consume), file_size_,
+         (wal_->GetWriteHead() - wal_->GetWriteTail()) * 512);
+
+  return s;
+}
+
+IOStatus ZoneFile::NormalPositionedRead(uint64_t offset, size_t n,
+                                        Slice* result, char* scratch,
+                                        bool direct) {
   ZenFSMetricsLatencyGuard guard(zbd_->GetMetrics(), ZENFS_READ_LATENCY,
                                  Env::Default());
   zbd_->GetMetrics()->ReportQPS(ZENFS_READ_QPS, 1);
 
   ReadLock lck(this);
+
+  IOStatus s;
+  bool iswal = false;
+
+  if (iswal && wal_entries_.size() == 0) {
+    s = RecoverWAL();
+    if (!s.ok()) return s;
+  }
 
   char* ptr;
   uint64_t r_off;
@@ -382,7 +612,7 @@ IOStatus ZoneFile::PositionedRead(uint64_t offset, size_t n, Slice* result,
   size_t read = 0;
   ZoneExtent* extent;
   uint64_t extent_end;
-  IOStatus s;
+  uint64_t extend_id;
 
   if (offset >= file_size_) {
     *result = Slice(scratch, 0);
@@ -390,13 +620,14 @@ IOStatus ZoneFile::PositionedRead(uint64_t offset, size_t n, Slice* result,
   }
 
   r_off = 0;
-  extent = GetExtent(offset, &r_off);
+  extent = iswal ? GetWALExtent(offset, &r_off, &extend_id)
+                 : GetExtent(offset, &r_off);
   if (!extent) {
     /* read start beyond end of (synced) file data*/
     *result = Slice(scratch, 0);
     return s;
   }
-  extent_end = extent->start_ + extent->length_;
+  extent_end = iswal ? extent->length_ : extent->start_ + extent->length_;
 
   /* Limit read size to end of file */
   if ((offset + n) > file_size_)
@@ -423,7 +654,13 @@ IOStatus ZoneFile::PositionedRead(uint64_t offset, size_t n, Slice* result,
       aligned = true;
     }
 
-    r = zbd_->Read(ptr, r_off, pread_sz, direct && aligned);
+    if (iswal) {
+      memcpy(ptr, wal_entries_[extend_id].second + r_off, pread_sz);
+      r = pread_sz;
+    } else {
+      r = zbd_->Read(ptr, r_off, pread_sz, direct && aligned);
+    }
+
     if (r <= 0) break;
 
     /* Verify and update the the bytes read count (if read size was incremented,
@@ -439,13 +676,14 @@ IOStatus ZoneFile::PositionedRead(uint64_t offset, size_t n, Slice* result,
     r_off += pread_sz;
 
     if (read != r_sz && r_off == extent_end) {
-      extent = GetExtent(offset + read, &r_off);
+      extent = iswal ? GetWALExtent(offset + read, &r_off, &extend_id)
+                     : GetExtent(offset + read, &r_off);
       if (!extent) {
         /* read beyond end of (synced) file data */
         break;
       }
-      r_off = extent->start_;
-      extent_end = extent->start_ + extent->length_;
+      r_off = iswal ? 0 : extent->start_;
+      extent_end = iswal ? extent->length_ : extent->start_ + extent->length_;
     }
   }
 
@@ -455,6 +693,164 @@ IOStatus ZoneFile::PositionedRead(uint64_t offset, size_t n, Slice* result,
   }
 
   *result = Slice((char*)scratch, read);
+  return s;
+}
+
+IOStatus ZoneFile::WALPositionedRead(uint64_t offset, size_t n, Slice* result,
+                                     char* scratch, bool direct) {
+  struct timespec tp_1;
+  struct timespec tp_2;
+
+  ZenFSMetricsLatencyGuard guard(zbd_->GetMetrics(), ZENFS_READ_LATENCY,
+                                 Env::Default());
+  zbd_->GetMetrics()->ReportQPS(ZENFS_READ_QPS, 1);
+
+  ReadLock lck(this);
+
+  IOStatus s;
+  bool iswal = ends_with(linkfiles_[0], ".log");
+
+  if (iswal && wal_entries_.size() == 0) {
+    s = RecoverWAL();
+    if (!s.ok()) return s;
+  }
+
+  if (iswal) {
+    clock_gettime(CLOCK_MONOTONIC, &tp_1);
+  }
+
+  char* ptr;
+  uint64_t r_off = 0;
+  size_t r_sz;
+  ssize_t r = 0;
+  size_t read = 0;
+  ZoneExtent* extent;
+  uint64_t extent_end;
+  uint64_t extend_id = 0;
+
+  if (iswal) {
+    extend_id = reader_offset_index_;
+  }
+
+  if (offset >= file_size_) {
+    *result = Slice(scratch, 0);
+    return IOStatus::OK();
+  }
+
+  extent = iswal ? GetWALExtent(r_off, &r_off, &extend_id)
+                 : GetExtent(offset, &r_off);
+  if (iswal) {
+    r_off = reader_offset_;
+  }
+
+  if (!extent) {
+    /* read start beyond end of (synced) file data*/
+    *result = Slice(scratch, 0);
+    return s;
+  }
+  extent_end = iswal ? extent->length_ : extent->start_ + extent->length_;
+
+  /* Limit read size to end of file */
+  if ((offset + n) > file_size_)
+    r_sz = file_size_ - offset;
+  else
+    r_sz = n;
+
+  ptr = scratch;
+
+  while (read != r_sz) {
+    size_t pread_sz = r_sz - read;
+
+    if ((pread_sz + r_off) > extent_end) pread_sz = extent_end - r_off;
+
+    /* We may get some unaligned direct reads due to non-aligned extent lengths,
+     * so increase read request size to be aligned to next blocksize boundary.
+     */
+    bool aligned = (pread_sz % zbd_->GetBlockSize() == 0);
+
+    size_t bytes_to_align = 0;
+    if (direct && !aligned) {
+      bytes_to_align = zbd_->GetBlockSize() - (pread_sz % zbd_->GetBlockSize());
+      pread_sz += bytes_to_align;
+      aligned = true;
+    }
+
+    if (iswal) {
+      memcpy(ptr, wal_entries_[extend_id].second->data() + r_off, pread_sz);
+      r = pread_sz;
+    } else {
+      r = zbd_->Read(ptr, r_off, pread_sz, direct && aligned);
+    }
+
+    if (r <= 0) break;
+
+    /* Verify and update the the bytes read count (if read size was incremented,
+     * for alignment purposes).
+     */
+    if ((size_t)r <= pread_sz - bytes_to_align)
+      pread_sz = (size_t)r;
+    else
+      pread_sz -= bytes_to_align;
+
+    ptr += pread_sz;
+    read += pread_sz;
+    r_off += pread_sz;
+
+    if (read != r_sz && r_off == extent_end) {
+      extent = iswal ? GetWALExtent(r_off, &r_off, &extend_id)
+                     : GetExtent(offset + read, &r_off);
+
+      if (!extent) {
+        break;
+      }
+      r_off = iswal ? 0 : extent->start_;
+      extent_end = iswal ? extent->length_ : extent->start_ + extent->length_;
+    }
+  }
+
+  if (iswal && r_off == extent_end) {
+    extent = iswal ? GetWALExtent(r_off, &r_off, &extend_id)
+                   : GetExtent(offset + read, &r_off);
+
+    if (extent) {
+      r_off = iswal ? 0 : extent->start_;
+      extent_end = iswal ? extent->length_ : extent->start_ + extent->length_;
+    }
+  }
+
+  if (r < 0) {
+    s = IOStatus::IOError("pread error\n");
+    read = 0;
+  }
+
+  *result = Slice((char*)scratch, read);
+
+  if (iswal) {
+    clock_gettime(CLOCK_MONOTONIC, &tp_2);
+    uint64_t time_passed = 0;
+    if (tp_2.tv_nsec < tp_1.tv_nsec) {
+      time_passed += 1000'000'000 - (tp_1.tv_nsec - tp_2.tv_nsec);
+      tp_2.tv_sec -= 1;
+    } else {
+      time_passed += tp_2.tv_nsec - tp_1.tv_nsec;
+    }
+    time_passed += 1000'000'000 * (tp_2.tv_sec - tp_1.tv_sec);
+
+    wal_read_time_count_++;
+    wal_read_time_sum_ += time_passed;
+    wal_read_time_sum_squared_ += time_passed * time_passed;
+
+    reader_offset_index_ = extend_id;
+    reader_offset_ = r_off;
+  }
+  last_read = offset + read;
+
+  return s;
+}
+
+IOStatus ZoneFile::PositionedRead(uint64_t offset, size_t n, Slice* result,
+                                  char* scratch, bool direct) {
+  IOStatus s = WALPositionedRead(offset, n, result, scratch, direct);
   return s;
 }
 
@@ -477,8 +873,23 @@ void ZoneFile::PushExtent() {
 }
 
 IOStatus ZoneFile::AllocateNewZone() {
+  IOStatus s;
   Zone* zone;
-  IOStatus s = zbd_->AllocateIOZone(lifetime_, io_type_, &zone);
+
+  if (is_wal_) {
+    Zone* z = nullptr;
+    for (auto e : extents_) {
+      if (z == nullptr) {
+        z = e->zone_;
+      } else if (e->zone_->GetZoneNr() > z->GetZoneNr()) {
+        z = e->zone_;
+      }
+    }
+    s = zbd_->AllocateWALZone(&zone, &wal_, z);
+    if (!s.ok()) return s;
+  } else {
+    s = zbd_->AllocateIOZone(lifetime_, io_type_, &zone);
+  }
 
   if (!s.ok()) return s;
   if (!zone) {
@@ -520,8 +931,13 @@ IOStatus ZoneFile::BufferedAppend(char* buffer, uint32_t data_size) {
 
     uint64_t extent_length = wr_size;
 
-    s = active_zone_->Append(buffer, wr_size + pad_sz);
-    if (!s.ok()) return s;
+    if (is_wal_) {
+      s = active_zone_->ZoneAppend(buffer, wr_size + pad_sz, wal_);
+      if (!s.ok()) return s;
+    } else {
+      s = active_zone_->Append(buffer, wr_size + pad_sz);
+      if (!s.ok()) return s;
+    }
 
     extents_.push_back(
         new ZoneExtent(extent_start_, extent_length, active_zone_));
@@ -552,7 +968,8 @@ IOStatus ZoneFile::BufferedAppend(char* buffer, uint32_t data_size) {
 IOStatus ZoneFile::SparseAppend(char* sparse_buffer, uint32_t data_size) {
   uint32_t left = data_size;
   uint32_t wr_size;
-  uint32_t block_sz = GetBlockSize();
+  // TODO: Fix for smaller blocks
+  uint32_t block_sz = 4096;  // GetBlockSize();
   IOStatus s;
 
   if (active_zone_ == NULL) {
@@ -561,7 +978,10 @@ IOStatus ZoneFile::SparseAppend(char* sparse_buffer, uint32_t data_size) {
   }
 
   while (left) {
-    wr_size = left + ZoneFile::SPARSE_HEADER_SIZE;
+    uint64_t header_size = ZoneFile::SPARSE_HEADER_SIZE +
+                           (is_wal_ * ZoneFile::SPARSE_WAL_HEADER_SIZE);
+
+    wr_size = left + header_size;
     if (wr_size > active_zone_->capacity_) wr_size = active_zone_->capacity_;
 
     /* Pad to the next block boundary if needed */
@@ -574,15 +994,22 @@ IOStatus ZoneFile::SparseAppend(char* sparse_buffer, uint32_t data_size) {
      * this is safe */
     if (pad_sz) memset(sparse_buffer + wr_size, 0x0, pad_sz);
 
-    uint64_t extent_length = wr_size - ZoneFile::SPARSE_HEADER_SIZE;
+    uint64_t extent_length = wr_size - header_size;
     EncodeFixed64(sparse_buffer, extent_length);
+    EncodeFixed64(sparse_buffer + sizeof(uint64_t), wal_seq_++);
 
-    s = active_zone_->Append(sparse_buffer, wr_size + pad_sz);
-    if (!s.ok()) return s;
+    if (is_wal_) {
+      s = active_zone_->ZoneAppend(sparse_buffer, wr_size + pad_sz, wal_);
+      if (!s.ok()) {
+        return s;
+      }
+    } else {
+      s = active_zone_->Append(sparse_buffer, wr_size + pad_sz);
+      if (!s.ok()) return s;
+    }
 
-    extents_.push_back(
-        new ZoneExtent(extent_start_ + ZoneFile::SPARSE_HEADER_SIZE,
-                       extent_length, active_zone_));
+    extents_.push_back(new ZoneExtent(extent_start_ + header_size,
+                                      extent_length, active_zone_));
 
     extent_start_ = active_zone_->wp_;
     active_zone_->used_capacity_ += extent_length;
@@ -595,7 +1022,7 @@ IOStatus ZoneFile::SparseAppend(char* sparse_buffer, uint32_t data_size) {
         return s;
       }
       if (left) {
-        memmove((void*)(sparse_buffer + ZoneFile::SPARSE_HEADER_SIZE),
+        memmove((void*)(sparse_buffer + header_size),
                 (void*)(sparse_buffer + wr_size), left);
       }
       s = AllocateNewZone();
@@ -654,12 +1081,16 @@ IOStatus ZoneFile::RecoverSparseExtents(uint64_t start, uint64_t end,
   int recovered_segments = 0;
   int ret;
 
+  uint64_t wal_seq_rec = wal_seq_.load(std::memory_order_consume);
+
   ret = posix_memalign((void**)&buffer, sysconf(_SC_PAGESIZE), block_sz);
   if (ret) {
     return IOStatus::IOError("Out of memory while recovering");
   }
 
   while (next_extent_start < end) {
+    uint64_t header_size = ZoneFile::SPARSE_HEADER_SIZE +
+                           (is_wal_ * ZoneFile::SPARSE_WAL_HEADER_SIZE);
     uint64_t extent_length;
 
     ret = zbd_->Read(buffer, next_extent_start, block_sz, false);
@@ -668,7 +1099,12 @@ IOStatus ZoneFile::RecoverSparseExtents(uint64_t start, uint64_t end,
       break;
     }
 
+    // Decode WAL meta
     extent_length = DecodeFixed64(buffer);
+    uint64_t wal_seq_rec_tmp = DecodeFixed64(buffer + sizeof(uint64_t));
+    if (wal_seq_rec_tmp > wal_seq_rec) {
+      wal_seq_rec = wal_seq_rec_tmp;
+    }
     if (extent_length == 0) {
       s = IOStatus::IOError("Unexpected extent length while recovering");
       break;
@@ -676,15 +1112,17 @@ IOStatus ZoneFile::RecoverSparseExtents(uint64_t start, uint64_t end,
     recovered_segments++;
 
     zone->used_capacity_ += extent_length;
-    extents_.push_back(new ZoneExtent(next_extent_start + SPARSE_HEADER_SIZE,
-                                      extent_length, zone));
+    extents_.push_back(
+        new ZoneExtent(next_extent_start + header_size, extent_length, zone));
 
-    uint64_t extent_blocks = (extent_length + SPARSE_HEADER_SIZE) / block_sz;
-    if ((extent_length + SPARSE_HEADER_SIZE) % block_sz) {
+    uint64_t extent_blocks = (extent_length + header_size) / block_sz;
+    if ((extent_length + header_size) % block_sz) {
       extent_blocks++;
     }
     next_extent_start += extent_blocks * block_sz;
   }
+
+  wal_seq_.store(wal_seq_rec, std::memory_order_release);
 
   free(buffer);
   return s;
@@ -809,6 +1247,7 @@ ZonedWritableFile::ZonedWritableFile(ZonedBlockDevice* zbd, bool _buffered,
     if (zoneFile->IsSparse()) {
       size_t sparse_buffer_sz;
 
+      // Change buffer size here
       sparse_buffer_sz =
           1024 * 1024 + block_sz; /* one extra block size for padding */
       int ret = posix_memalign((void**)&sparse_buffer, sysconf(_SC_PAGESIZE),
@@ -818,8 +1257,12 @@ ZonedWritableFile::ZonedWritableFile(ZonedBlockDevice* zbd, bool _buffered,
 
       assert(sparse_buffer != nullptr);
 
-      buffer_sz = sparse_buffer_sz - ZoneFile::SPARSE_HEADER_SIZE - block_sz;
-      buffer = sparse_buffer + ZoneFile::SPARSE_HEADER_SIZE;
+      uint64_t header_size =
+          ZoneFile::SPARSE_HEADER_SIZE +
+          (zoneFile->IsWAL() * ZoneFile::SPARSE_WAL_HEADER_SIZE);
+
+      buffer_sz = sparse_buffer_sz - header_size - block_sz;
+      buffer = sparse_buffer + header_size;
     } else {
       buffer_sz = 1024 * 1024;
       int ret =
@@ -858,6 +1301,10 @@ IOStatus ZonedWritableFile::Truncate(uint64_t size,
 }
 
 IOStatus ZonedWritableFile::DataSync() {
+  if (zoneFile_->IsWAL()) {
+    zoneFile_->WALSync();
+  }
+
   if (buffered) {
     IOStatus s;
     buffer_mtx_.lock();
@@ -1077,6 +1524,16 @@ IOStatus ZonedRandomAccessFile::Read(uint64_t offset, size_t n,
                                      Slice* result, char* scratch,
                                      IODebugContext* /*dbg*/) const {
   return zoneFile_->PositionedRead(offset, n, result, scratch, direct_);
+}
+
+IOStatus ZoneFile::WALSync() {
+  if (wal_) {
+    zbd_->AppendSync(wal_);
+    return wal_->Sync() == SZD::SZDStatus::Success
+               ? IOStatus::OK()
+               : IOStatus::IOError("Error WAL sync");
+  }
+  return IOStatus::OK();
 }
 
 IOStatus ZoneFile::MigrateData(uint64_t offset, uint32_t length,

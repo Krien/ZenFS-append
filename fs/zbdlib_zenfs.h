@@ -15,6 +15,8 @@
 #include "rocksdb/io_status.h"
 #include "zbd_zenfs.h"
 
+// #define REORDER_WAL_TEST
+
 namespace ROCKSDB_NAMESPACE {
 
 class ZbdlibBackend : public ZonedBlockDeviceBackend {
@@ -23,6 +25,8 @@ class ZbdlibBackend : public ZonedBlockDeviceBackend {
   int read_f_;
   int read_direct_f_;
   int write_f_;
+
+  std::mutex wal_mtx_;
 
  public:
   explicit ZbdlibBackend(std::string bdevname);
@@ -40,6 +44,10 @@ class ZbdlibBackend : public ZonedBlockDeviceBackend {
   IOStatus Close(uint64_t start);
   int Read(char *buf, int size, uint64_t pos, bool direct);
   int Write(char *data, uint32_t size, uint64_t pos);
+  int Append(char *data, uint32_t size,  SZD::SZDOnceLog *wal);
+  int AppendSync(SZD::SZDOnceLog *wal);
+
+
   int InvalidateCache(uint64_t pos, uint64_t size);
 
   bool ZoneIsSwr(std::unique_ptr<ZoneList> &zones, unsigned int idx) {
@@ -87,6 +95,12 @@ class ZbdlibBackend : public ZonedBlockDeviceBackend {
  private:
   IOStatus CheckScheduler();
   std::string ErrorToString(int err);
+
+#ifdef REORDER_WAL_TEST
+  char* tmp_appends_val[16];
+  bool tmps_wals_bools[16];
+  uint32_t tmps_wals_size[16];
+#endif
 };
 
 }  // namespace ROCKSDB_NAMESPACE

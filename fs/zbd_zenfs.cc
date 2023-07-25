@@ -11,11 +11,13 @@
 #include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <liburing.h>
 #include <libzbd/zbd.h>
 #include <linux/blkzoned.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <cstdlib>
@@ -42,6 +44,14 @@
  * is allocated to cover for one zone going offline.
  */
 #define ZENFS_META_ZONES (3)
+
+// The VM says no
+#define ZENFS_FLAKY_ZONES (1)
+
+/* Number of reserved zones for WALs. */
+//#define ZENFS_WAL_ZONES (32)
+#define ZENFS_WAL_ZONES (15)
+#define ZENFS_ZONES_FOREACH_WAL (3)
 
 /* Minimum of number of zones that makes sense */
 #define ZENFS_MIN_ZONES (32)
@@ -124,6 +134,24 @@ IOStatus Zone::Close() {
   return IOStatus::OK();
 }
 
+IOStatus Zone::ZoneAppend(char *data, uint32_t size, SZD::SZDOnceLog *wal) {
+  int ret;
+
+  if (capacity_ < size)
+    return IOStatus::NoSpace("Not enough capacity for zoneappend");
+
+  ret = zbd_be_->Append(data, size, wal);
+  if (ret < 0) {
+    return IOStatus::IOError(strerror(errno));
+  }
+
+  wp_ += size;
+  capacity_ -= size;
+  zbd_->AddBytesWritten(size);
+
+  return IOStatus::OK();
+}
+
 IOStatus Zone::Append(char *data, uint32_t size) {
   ZenFSMetricsLatencyGuard guard(zbd_->GetMetrics(), ZENFS_ZONE_WRITE_LATENCY,
                                  Env::Default());
@@ -149,7 +177,6 @@ IOStatus Zone::Append(char *data, uint32_t size) {
     left -= ret;
     zbd_->AddBytesWritten(ret);
   }
-
   return IOStatus::OK();
 }
 
@@ -164,9 +191,38 @@ inline IOStatus Zone::CheckRelease() {
 }
 
 Zone *ZonedBlockDevice::GetIOZone(uint64_t offset) {
-  for (const auto z : io_zones)
+  for (const auto z : io_zones) {
     if (z->start_ <= offset && offset < (z->start_ + zbd_be_->GetZoneSize()))
       return z;
+  }
+
+  for (const auto z : wal_zones) {
+    if (z->start_ <= offset && offset < (z->start_ + zbd_be_->GetZoneSize()))
+      return z;
+  }
+  return nullptr;
+}
+
+SZD::SZDOnceLog *ZonedBlockDevice::GetWAL(uint64_t offset) {
+  for (size_t i = 0; i < wal_zones.size(); i += 3) {
+    const auto z = wal_zones[i];
+    if (z->start_ <= offset && offset < (z->start_ + zbd_be_->GetZoneSize())) {
+      int old_ind = write_channel_ptr_;
+      int next_ind = (old_ind + 1) % write_channel_size_;
+      while (!write_channel_ptr_.compare_exchange_weak(
+          old_ind, next_ind, std::memory_order_release,
+          std::memory_order_relaxed)) {
+        old_ind = write_channel_ptr_;
+        next_ind = (old_ind + 1) % write_channel_size_;
+      }
+      SZD::SZDOnceLog *wal = new SZD::SZDOnceLog(
+          szd_factory_, *di, i + ZENFS_META_ZONES + ZENFS_FLAKY_ZONES,
+          i + ZENFS_META_ZONES + ZENFS_ZONES_FOREACH_WAL + ZENFS_FLAKY_ZONES,
+          write_channel_[next_ind]);
+      wal->RecoverPointers();
+      return wal;
+    }
+  }
   return nullptr;
 }
 
@@ -181,6 +237,28 @@ ZonedBlockDevice::ZonedBlockDevice(std::string path, ZbdBackendType backend,
     zbd_be_ = std::unique_ptr<ZoneFsBackend>(new ZoneFsBackend(path));
     Info(logger_, "New zonefs backing: %s", zbd_be_->GetFilename().c_str());
   }
+}
+
+IOStatus ZonedBlockDevice::OpenCharacterDevice(std::string ch_path) {
+  szd_device_ = new SZD::SZDDevice("ZenFS-WAL");
+  szd_device_->Init();
+  szd_device_->Open(ch_path, ZENFS_META_ZONES + ZENFS_FLAKY_ZONES,
+                    ZENFS_META_ZONES + ZENFS_WAL_ZONES + ZENFS_FLAKY_ZONES);
+  szd_factory_ =
+      new SZD::SZDChannelFactory(szd_device_->GetEngineManager(), 12);
+  szd_factory_->Ref();
+  di = new SZD::DeviceInfo();
+  szd_device_->GetInfo(di);
+
+  write_channel_ = new SZD::SZDChannel *[write_channel_size_];
+  for (size_t i = 0; i < write_channel_size_; i++) {
+    szd_factory_->register_channel(
+        &write_channel_[i], ZENFS_META_ZONES + ZENFS_FLAKY_ZONES,
+        ZENFS_META_ZONES + ZENFS_WAL_ZONES + ZENFS_FLAKY_ZONES, true,
+        // WAL DEPTH
+        128);
+  }
+  return IOStatus::OK();
 }
 
 IOStatus ZonedBlockDevice::Open(bool readonly, bool exclusive) {
@@ -236,6 +314,20 @@ IOStatus ZonedBlockDevice::Open(bool readonly, bool exclusive) {
     i++;
   }
 
+  while (i < ZENFS_META_ZONES + ZENFS_FLAKY_ZONES) i++;
+
+  // Eat WAL ZONES
+  while (i < ZENFS_META_ZONES + ZENFS_FLAKY_ZONES + ZENFS_WAL_ZONES) {
+    /* Only use sequential write required zones */
+    if (zbd_be_->ZoneIsSwr(zone_rep, i)) {
+      if (!zbd_be_->ZoneIsOffline(zone_rep, i)) {
+        Zone *z = new Zone(this, zbd_be_.get(), zone_rep, i);
+        wal_zones.push_back(z);
+      }
+    }
+    i++;
+  }
+
   active_io_zones_ = 0;
   open_io_zones_ = 0;
 
@@ -266,9 +358,17 @@ IOStatus ZonedBlockDevice::Open(bool readonly, bool exclusive) {
     }
   }
 
+  // Passthrough
+  std::string char_filename = zbd_be_->GetFilename().replace(
+      zbd_be_->GetFilename().find("nvme"), std::string("nvme").size(), "ng");
+  printf("Opening character device: %s\n", char_filename.c_str());
+
+  IOStatus status = OpenCharacterDevice(char_filename);
+  printf("Opened character device\n");
+
   start_time_ = time(NULL);
 
-  return IOStatus::OK();
+  return status;
 }
 
 uint64_t ZonedBlockDevice::GetFreeSpace() {
@@ -388,6 +488,17 @@ ZonedBlockDevice::~ZonedBlockDevice() {
   for (const auto z : io_zones) {
     delete z;
   }
+
+  for (const auto z : wal_zones) {
+    delete z;
+  }
+
+  if (szd_factory_ != nullptr) {
+    szd_factory_->Unref();
+  }
+  if (szd_device_ != nullptr) {
+    delete szd_device_;
+  }
 }
 
 #define LIFETIME_DIFF_NOT_GOOD (100)
@@ -439,6 +550,30 @@ IOStatus ZonedBlockDevice::AllocateMetaZone(Zone **out_meta_zone) {
   return IOStatus::NoSpace("Out of metadata zones");
 }
 
+// HEREDOC
+IOStatus ZonedBlockDevice::ReleaseUnusedWALZones() {
+  IOStatus s = IOStatus::OK();
+  // ZENFS_FLAKY_ZONES;
+  for (size_t i = 0; i < ZENFS_WAL_ZONES; i++) {
+    const auto z = wal_zones[i];
+    if (z->Acquire()) {
+      if (!z->IsEmpty() && !z->IsUsed()) {
+        bool full = z->IsFull();
+
+        z->capacity_ = z->max_capacity_;
+        z->wp_ = z->start_;
+        // z->Reset();
+
+        s = z->CheckRelease();
+        if (!full) PutActiveIOZoneToken();
+      } else {
+        s = z->CheckRelease();
+      }
+    }
+  }
+  return s;
+}
+
 IOStatus ZonedBlockDevice::ResetUnusedIOZones() {
   for (const auto z : io_zones) {
     if (z->Acquire()) {
@@ -446,12 +581,18 @@ IOStatus ZonedBlockDevice::ResetUnusedIOZones() {
         bool full = z->IsFull();
         IOStatus reset_status = z->Reset();
         IOStatus release_status = z->CheckRelease();
-        if (!reset_status.ok()) return reset_status;
-        if (!release_status.ok()) return release_status;
+        if (!reset_status.ok()) {
+          return reset_status;
+        }
+        if (!release_status.ok()) {
+          return release_status;
+        }
         if (!full) PutActiveIOZoneToken();
       } else {
         IOStatus release_status = z->CheckRelease();
-        if (!release_status.ok()) return release_status;
+        if (!release_status.ok()) {
+          return release_status;
+        }
       }
     }
   }
@@ -828,6 +969,150 @@ IOStatus ZonedBlockDevice::AllocateIOZone(Env::WriteLifeTimeHint file_lifetime,
   metrics_->ReportGeneral(ZENFS_ACTIVE_ZONES_COUNT, active_io_zones_);
 
   return IOStatus::OK();
+}
+
+IOStatus ZonedBlockDevice::OpenWALZone(SZD::SZDOnceLog **wal,
+                                       Zone *active_zone) {
+  Zone *allocated_zone = nullptr;
+  IOStatus s;
+
+  WaitForOpenIOZoneToken(true);
+  while (!GetActiveIOZoneTokenIfAvailable())
+    ;
+
+  const auto z = wal_zones[active_zone->GetZoneNr() - ZENFS_META_ZONES -
+                           ZENFS_FLAKY_ZONES];
+  while (!z->Acquire())
+    ;
+  allocated_zone = z;
+
+  if (allocated_zone == nullptr) {
+    PutActiveIOZoneToken();
+    PutOpenIOZoneToken();
+    return IOStatus::NoSpace("No WAL space left (during open)");
+  } else {
+    fprintf(stdout, "Opened WAL zone start: 0x%lx wp: 0x%lx\n",
+            allocated_zone->start_, allocated_zone->wp_);
+  }
+
+  if (*wal) {
+    delete *wal;
+  }
+
+  int old_ind = write_channel_ptr_;
+  int next_ind = (old_ind + 1) % write_channel_size_;
+  while (!write_channel_ptr_.compare_exchange_weak(old_ind, next_ind,
+                                                   std::memory_order_release,
+                                                   std::memory_order_relaxed)) {
+    old_ind = write_channel_ptr_;
+    next_ind = (old_ind + 1) % write_channel_size_;
+  }
+
+  *wal = new SZD::SZDOnceLog(szd_factory_, *di, z->GetZoneNr(),
+                             z->GetZoneNr() + ZENFS_ZONES_FOREACH_WAL,
+                             write_channel_[next_ind]);
+
+  s = (*wal)->RecoverPointers() == SZD::SZDStatus::Success
+          ? IOStatus::OK()
+          : IOStatus::IOError("WAL recover error");
+
+  return s;
+}
+
+IOStatus ZonedBlockDevice::AllocateWALZone(Zone **wal_zones_out,
+                                           SZD::SZDOnceLog **wal,
+                                           Zone *active_zone) {
+  Zone *allocated_zone = nullptr;
+  IOStatus s;
+
+  s = ReleaseUnusedWALZones();
+
+  if (active_zone) {
+    uint64_t w_z =
+        active_zone->GetZoneNr() - ZENFS_META_ZONES - ZENFS_FLAKY_ZONES;
+    w_z = (w_z % ZENFS_ZONES_FOREACH_WAL);
+
+    if ((w_z == ZENFS_ZONES_FOREACH_WAL - 1)) {
+    } else {
+      allocated_zone = wal_zones[active_zone->GetZoneNr() + 1 -
+                                 ZENFS_META_ZONES - ZENFS_FLAKY_ZONES];
+      *wal_zones_out = allocated_zone;
+      s = IOStatus::OK();
+
+      if (*wal == nullptr) {
+        int old_ind = write_channel_ptr_;
+        int next_ind = (old_ind + 1) % write_channel_size_;
+        while (!write_channel_ptr_.compare_exchange_weak(
+            old_ind, next_ind, std::memory_order_release,
+            std::memory_order_relaxed)) {
+          old_ind = write_channel_ptr_;
+          next_ind = (old_ind + 1) % write_channel_size_;
+        }
+
+        *wal = new SZD::SZDOnceLog(
+            szd_factory_, *di, w_z + ZENFS_META_ZONES + ZENFS_FLAKY_ZONES,
+            w_z + ZENFS_META_ZONES + ZENFS_ZONES_FOREACH_WAL +
+                ZENFS_FLAKY_ZONES,
+            write_channel_[next_ind]);
+        s = (*wal)->RecoverPointers() == SZD::SZDStatus::Success
+                ? IOStatus::OK()
+                : IOStatus::IOError("WAL recover error");
+      }
+
+      return s;
+    }
+  }
+
+  WaitForOpenIOZoneToken(true);
+  while (!GetActiveIOZoneTokenIfAvailable())
+    ;
+
+  size_t i = 0;
+  for (; i < ZENFS_WAL_ZONES; i += ZENFS_ZONES_FOREACH_WAL) {
+    const auto z = wal_zones[i];
+    if (z->Acquire()) {
+      if (z->IsEmpty()) {
+        allocated_zone = z;
+        break;
+      } else {
+        s = z->CheckRelease();
+        if (!s.ok()) return s;
+      }
+    } else {
+    }
+  }
+
+  if (allocated_zone == nullptr) {
+    PutActiveIOZoneToken();
+    PutOpenIOZoneToken();
+    return IOStatus::NoSpace("No WAL space left (during alloc)");
+  } else {
+  }
+
+  if (*wal) {
+    delete *wal;
+  }
+
+  int old_ind = write_channel_ptr_;
+  int next_ind = (old_ind + 1) % write_channel_size_;
+  while (!write_channel_ptr_.compare_exchange_weak(old_ind, next_ind,
+                                                   std::memory_order_release,
+                                                   std::memory_order_relaxed)) {
+    old_ind = write_channel_ptr_;
+    next_ind = (old_ind + 1) % write_channel_size_;
+  }
+
+  *wal = new SZD::SZDOnceLog(
+      szd_factory_, *di, i + ZENFS_META_ZONES + ZENFS_FLAKY_ZONES,
+      i + ZENFS_META_ZONES + ZENFS_ZONES_FOREACH_WAL + ZENFS_FLAKY_ZONES,
+      write_channel_[next_ind]);
+
+  s = (*wal)->RecoverPointers() == SZD::SZDStatus::Success
+          ? IOStatus::OK()
+          : IOStatus::IOError("WAL recover error");
+
+  *wal_zones_out = allocated_zone;
+  return s;
 }
 
 std::string ZonedBlockDevice::GetFilename() { return zbd_be_->GetFilename(); }

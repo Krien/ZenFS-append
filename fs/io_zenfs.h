@@ -63,12 +63,17 @@ class ZoneFile {
 
   Env::WriteLifeTimeHint lifetime_;
   IOType io_type_; /* Only used when writing */
+  bool is_wal_{false};
+  std::atomic<uint64_t> wal_seq_{0};
+  SZD::SZDOnceLog* wal_{nullptr};
+  std::vector<std::pair<uint64_t, std::string*> > wal_entries_;
   uint64_t file_size_;
   uint64_t file_id_;
 
   uint32_t nr_synced_extents_ = 0;
   bool open_for_wr_ = false;
   std::mutex open_for_wr_mtx_;
+  // std::mutex wal_mtx_;
 
   time_t m_time_;
   bool is_sparse_ = false;
@@ -79,13 +84,27 @@ class ZoneFile {
   std::mutex writer_mtx_;
   std::atomic<int> readers_{0};
 
+  uint64_t reader_offset_{0};
+  uint64_t reader_offset_index_{0};
+  uint64_t last_read{0};
+
+  uint64_t wal_read_time_count_{0};
+  uint64_t wal_read_time_sum_{0};
+  uint64_t wal_read_time_sum_squared_{0};
+
  public:
   static const int SPARSE_HEADER_SIZE = 8;
+  static const int SPARSE_WAL_HEADER_SIZE = 8;
 
   explicit ZoneFile(ZonedBlockDevice* zbd, uint64_t file_id_,
                     MetadataWriter* metadata_writer);
 
   virtual ~ZoneFile();
+
+  bool IsWAL() { return is_wal_; }
+  IOStatus WALSync();
+  uint64_t GetWALSeq() { return wal_seq_; }
+  IOStatus RecoverWAL();
 
   void AcquireWRLock();
   bool TryAcquireWRLock();
@@ -113,9 +132,16 @@ class ZoneFile {
   std::vector<ZoneExtent*> GetExtents() { return extents_; }
   Env::WriteLifeTimeHint GetWriteLifeTimeHint() { return lifetime_; }
 
+  IOStatus NormalPositionedRead(uint64_t offset, size_t n, Slice* result,
+                                char* scratch, bool direct);
+  IOStatus WALPositionedRead(uint64_t offset, size_t n, Slice* result,
+                             char* scratch, bool direct);
   IOStatus PositionedRead(uint64_t offset, size_t n, Slice* result,
                           char* scratch, bool direct);
   ZoneExtent* GetExtent(uint64_t file_offset, uint64_t* dev_offset);
+  ZoneExtent* GetWALExtent(uint64_t file_offset, uint64_t* dev_offset,
+                           uint64_t* index);
+
   void PushExtent();
   IOStatus AllocateNewZone();
 
@@ -151,6 +177,8 @@ class ZoneFile {
   const std::vector<std::string>& GetLinkFiles() const { return linkfiles_; }
 
   IOStatus InvalidateCache(uint64_t pos, uint64_t size);
+
+  IOStatus ResetZones();
 
  private:
   void ReleaseActiveZone();
